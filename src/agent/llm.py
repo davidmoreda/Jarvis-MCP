@@ -1,141 +1,251 @@
 """
-LLM Client — Abstracción que soporta Ollama (local) y Claude API
-Por defecto usa Ollama; escala a Claude para tareas complejas.
+LLM Client — Claude Agent SDK nativo (+ fallback Ollama)
+
+Autenticación:
+  - Opción A (recomendada): login con tu cuenta claude.ai → usa tu suscripción Pro
+      docker exec -it jarvis-api claude auth login
+  - Opción B: ANTHROPIC_API_KEY en .env → paga por tokens
+  - Fallback: Ollama local si Claude no está disponible
+
+El SDK maneja el agentic loop completo: tool calling, sesiones,
+streaming y coste de manera nativa. No necesitamos implementarlo.
 """
 import os
+import asyncio
+import uuid
 import json
-from typing import List, Dict, Optional
-import httpx
-from anthropic import AsyncAnthropic
+from typing import List, Dict, Optional, AsyncIterator
 
+# ── Detección de backend ────────────────────────────────────────────────────
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-6")
+OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3.2")
+CLAUDE_MODEL    = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
-# Si el usuario tiene API key de Anthropic, se puede usar Claude para
-# tareas complejas. Si no, todo va por Ollama.
-USE_CLAUDE = bool(ANTHROPIC_API_KEY)
+# El SDK usa la key si está presente; si no, usa el login OAuth del CLI
+os.environ.setdefault("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)
 
+
+def _claude_cli_available() -> bool:
+    """Comprueba si el claude CLI está instalado y autenticado."""
+    import shutil, subprocess
+    if not shutil.which("claude"):
+        return False
+    try:
+        result = subprocess.run(
+            ["claude", "--version"], capture_output=True, timeout=5
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _sdk_available() -> bool:
+    try:
+        import claude_code_sdk  # noqa
+        return True
+    except ImportError:
+        return False
+
+
+# ── Cliente Claude Agent SDK ────────────────────────────────────────────────
+
+class ClaudeSDKClient:
+    """
+    Wrapper sobre claude_code_sdk.query().
+
+    El SDK lanza el claude CLI como subproceso y devuelve un
+    AsyncIterator de mensajes tipados (AssistantMessage, ResultMessage…).
+    Toda la lógica de tool calling y sesiones es nativa del SDK.
+    """
+
+    def __init__(self):
+        from claude_code_sdk import ClaudeCodeOptions
+        self._options_cls = ClaudeCodeOptions
+
+    def _build_options(
+        self,
+        tools: Optional[List[Dict]] = None,
+        mcp_servers: Optional[Dict] = None,
+        session_id: Optional[str] = None,
+        max_turns: int = 10,
+    ):
+        """Convierte nuestros parámetros al formato ClaudeCodeOptions."""
+        kwargs = dict(
+            model=CLAUDE_MODEL,
+            max_turns=max_turns,
+            # Permisos: bypassPermissions para uso local de confianza
+            permission_mode="bypassPermissions",
+        )
+        if session_id:
+            kwargs["resume"] = session_id
+        if mcp_servers:
+            kwargs["mcp_servers"] = mcp_servers
+        # Si hay tools definidas como allowed_tools (nombres nativos claude)
+        if tools:
+            native_tools = [t.get("native_name") for t in tools if t.get("native_name")]
+            if native_tools:
+                kwargs["allowed_tools"] = native_tools
+
+        return self._options_cls(**kwargs)
+
+    async def query(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        mcp_servers: Optional[Dict] = None,
+        session_id: Optional[str] = None,
+        max_turns: int = 10,
+    ) -> Dict:
+        """
+        Ejecuta una query y devuelve la respuesta consolidada.
+        Retorna: { content, session_id, cost_usd, usage, turns }
+        """
+        from claude_code_sdk import query, AssistantMessage, ResultMessage, TextBlock
+
+        full_prompt = prompt
+        if system_prompt:
+            full_prompt = f"<system>{system_prompt}</system>\n\n{prompt}"
+
+        options = self._build_options(
+            mcp_servers=mcp_servers,
+            session_id=session_id,
+            max_turns=max_turns,
+        )
+
+        result_text = ""
+        new_session_id = session_id
+        cost = None
+        usage = {}
+        turns = 0
+
+        async for msg in query(prompt=full_prompt, options=options):
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, TextBlock):
+                        result_text += block.text
+
+            elif isinstance(msg, ResultMessage):
+                new_session_id = msg.session_id or new_session_id
+                cost = msg.total_cost_usd
+                turns = msg.num_turns
+                if msg.usage:
+                    usage = {
+                        "input_tokens":  msg.usage.get("input_tokens", 0),
+                        "output_tokens": msg.usage.get("output_tokens", 0),
+                    }
+
+        return {
+            "content":    result_text,
+            "session_id": new_session_id,
+            "cost_usd":   cost,
+            "usage":      usage,
+            "turns":      turns,
+            "tool_calls": None,  # el SDK los resuelve internamente
+        }
+
+    async def query_stream(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        mcp_servers: Optional[Dict] = None,
+        session_id: Optional[str] = None,
+    ) -> AsyncIterator[Dict]:
+        """Streaming: yield cada chunk de texto a medida que llega."""
+        from claude_code_sdk import query, AssistantMessage, ResultMessage, TextBlock
+
+        full_prompt = f"<system>{system_prompt}</system>\n\n{prompt}" if system_prompt else prompt
+        options = self._build_options(mcp_servers=mcp_servers, session_id=session_id)
+
+        async for msg in query(prompt=full_prompt, options=options):
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, TextBlock) and block.text:
+                        yield {"type": "text", "text": block.text}
+            elif isinstance(msg, ResultMessage):
+                yield {
+                    "type":       "done",
+                    "session_id": msg.session_id,
+                    "cost_usd":   msg.total_cost_usd,
+                    "turns":      msg.num_turns,
+                }
+
+
+# ── Fallback: Ollama ────────────────────────────────────────────────────────
+
+class OllamaClient:
+    """Cliente Ollama como fallback cuando Claude CLI no está disponible."""
+
+    async def query(
+        self,
+        messages: List[Dict],
+        tools: Optional[List[Dict]] = None,
+    ) -> Dict:
+        import httpx
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": messages,
+            "stream": False,
+            "options": {"temperature": 0.7},
+        }
+        if tools:
+            payload["tools"] = tools
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+
+        msg = data.get("message", {})
+        return {
+            "content":    msg.get("content", ""),
+            "tool_calls": msg.get("tool_calls"),
+            "session_id": None,
+            "cost_usd":   None,
+            "usage":      {},
+        }
+
+
+# ── Façade principal ────────────────────────────────────────────────────────
 
 class LLMClient:
+    """
+    Punto de entrada único para el agente.
+    Usa Claude Agent SDK si está disponible, si no cae a Ollama.
+    """
+
     def __init__(self):
-        self.anthropic = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if USE_CLAUDE else None
+        self._use_sdk = _sdk_available() and _claude_cli_available()
+        if self._use_sdk:
+            self._claude = ClaudeSDKClient()
+            print("✅ LLM backend: Claude Agent SDK (nativo)")
+        else:
+            self._ollama = OllamaClient()
+            print("⚠️  LLM backend: Ollama (Claude CLI no disponible)")
+
+    @property
+    def backend(self) -> str:
+        return "claude-sdk" if self._use_sdk else "ollama"
 
     async def chat(
         self,
         messages: List[Dict],
         tools: Optional[List[Dict]] = None,
         temperature: float = 0.7,
-        force_claude: bool = False,
+        mcp_servers: Optional[Dict] = None,
+        session_id: Optional[str] = None,
     ) -> Dict:
-        """
-        Enruta la petición a Ollama o Claude según disponibilidad.
-        force_claude=True fuerza el uso de Claude API.
-        """
-        if force_claude or (USE_CLAUDE and self._needs_advanced_reasoning(messages)):
-            return await self._chat_claude(messages, tools, temperature)
-        return await self._chat_ollama(messages, tools, temperature)
-
-    def _needs_advanced_reasoning(self, messages: List[Dict]) -> bool:
-        """Heurística simple: usa Claude si el mensaje es largo o complejo."""
-        last = messages[-1].get("content", "") if messages else ""
-        complex_keywords = ["analiza", "redacta", "escribe un", "planifica", "resume"]
-        return len(last) > 500 or any(kw in last.lower() for kw in complex_keywords)
-
-    # ── Ollama ──────────────────────────────────────────────────────────────
-
-    async def _chat_ollama(
-        self,
-        messages: List[Dict],
-        tools: Optional[List[Dict]],
-        temperature: float,
-    ) -> Dict:
-        payload = {
-            "model": OLLAMA_MODEL,
-            "messages": messages,
-            "stream": False,
-            "options": {"temperature": temperature},
-        }
-        if tools:
-            payload["tools"] = tools
-
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                f"{OLLAMA_BASE_URL}/api/chat",
-                json=payload,
+        if self._use_sdk:
+            # Extraer system + último user message
+            system = next((m["content"] for m in messages if m["role"] == "system"), None)
+            user_msgs = [m["content"] for m in messages if m["role"] == "user"]
+            prompt = user_msgs[-1] if user_msgs else ""
+            return await self._claude.query(
+                prompt=prompt,
+                system_prompt=system,
+                mcp_servers=mcp_servers,
+                session_id=session_id,
             )
-            resp.raise_for_status()
-            data = resp.json()
-
-        msg = data.get("message", {})
-        return {
-            "content": msg.get("content", ""),
-            "tool_calls": msg.get("tool_calls"),
-            "usage": {},
-        }
-
-    # ── Claude API ──────────────────────────────────────────────────────────
-
-    async def _chat_claude(
-        self,
-        messages: List[Dict],
-        tools: Optional[List[Dict]],
-        temperature: float,
-    ) -> Dict:
-        # Separar system prompt
-        system = ""
-        filtered = []
-        for m in messages:
-            if m["role"] == "system":
-                system = m["content"]
-            else:
-                filtered.append(m)
-
-        kwargs = {
-            "model": CLAUDE_MODEL,
-            "max_tokens": 2048,
-            "temperature": temperature,
-            "messages": filtered,
-        }
-        if system:
-            kwargs["system"] = system
-        if tools:
-            # Convertir formato OpenAI → Anthropic
-            kwargs["tools"] = [
-                {
-                    "name": t["function"]["name"],
-                    "description": t["function"].get("description", ""),
-                    "input_schema": t["function"].get("parameters", {}),
-                }
-                for t in tools
-            ]
-
-        response = await self.anthropic.messages.create(**kwargs)
-
-        # Convertir respuesta Anthropic → formato interno
-        content_text = ""
-        tool_calls = []
-
-        for block in response.content:
-            if block.type == "text":
-                content_text += block.text
-            elif block.type == "tool_use":
-                tool_calls.append({
-                    "id": block.id,
-                    "type": "function",
-                    "function": {
-                        "name": block.name,
-                        "arguments": json.dumps(block.input),
-                    }
-                })
-
-        return {
-            "content": content_text,
-            "tool_calls": tool_calls if tool_calls else None,
-            "usage": {
-                "input_tokens": response.usage.input_tokens,
-                "output_tokens": response.usage.output_tokens,
-            },
-        }
+        else:
+            return await self._ollama.query(messages=messages, tools=tools)
