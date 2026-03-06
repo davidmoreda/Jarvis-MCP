@@ -12,15 +12,17 @@ services:
     volumes:
       # Datos persistentes (memoria SQLite, proyectos)
       - jarvis-data:/app/data
-      # Credenciales Google OAuth (necesitas ponerlas antes de levantar)
+      # Credenciales Google OAuth
       - ./credentials:/app/credentials:ro
-    depends_on:
-      ollama:
-        condition: service_healthy
+      # ⭐ Config del Claude CLI — persiste el login OAuth entre reinicios
+      # Después del primer "claude auth login" no hace falta volver a hacer login
+      - claude-config:/root/.claude
     networks:
       - jarvis-net
 
-  # ── Ollama (LLM local) ─────────────────────────────────────────────────────
+  # ── Ollama (LLM fallback) ──────────────────────────────────────────────────
+  # Solo se usa si Claude CLI no está autenticado.
+  # Puedes eliminarlo si siempre usas Claude.
   ollama:
     image: ollama/ollama:latest
     container_name: jarvis-ollama
@@ -37,7 +39,7 @@ services:
       start_period: 30s
     networks:
       - jarvis-net
-    # Si tienes GPU NVIDIA descomenta esto:
+    # GPU NVIDIA — descomenta si la tienes:
     # deploy:
     #   resources:
     #     reservations:
@@ -55,7 +57,7 @@ services:
       sh -c "
         sleep 5 &&
         ollama pull ${OLLAMA_MODEL:-llama3.2} &&
-        echo 'Model pulled successfully'
+        echo 'Model pulled OK'
       "
     environment:
       - OLLAMA_HOST=http://ollama:11434
@@ -68,6 +70,7 @@ services:
 volumes:
   jarvis-data:
   ollama-models:
+  claude-config:    # ⭐ Persiste la sesión OAuth del claude CLI
 
 networks:
   jarvis-net:
