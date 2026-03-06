@@ -1,10 +1,18 @@
+# ── API Server ─────────────────────────────────────────────────────────────
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 pydantic>=2.0.0
-httpx>=0.26.0
 python-dotenv>=1.0.0
-anthropic>=0.25.0
-# Google APIs
+
+# ── Claude Agent SDK (core del proyecto) ──────────────────────────────────
+# Requiere que claude CLI esté instalado: npm install -g @anthropic-ai/claude-code
+claude-code-sdk>=0.0.10
+
+# ── Fallback LLM + HTTP ───────────────────────────────────────────────────
+httpx>=0.26.0
+anthropic>=0.25.0       # usado como fallback directo si se desea
+
+# ── Google APIs (Calendar + Gmail) ────────────────────────────────────────
 google-api-python-client>=2.120.0
 google-auth-httplib2>=0.2.0
 google-auth-oauthlib>=1.2.0
