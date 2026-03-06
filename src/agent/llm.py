@@ -18,7 +18,7 @@ from typing import List, Dict, Optional, AsyncIterator
 
 # ── Detección de backend ────────────────────────────────────────────────────
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3.2")
 CLAUDE_MODEL    = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -197,7 +197,8 @@ class OllamaClient:
             resp.raise_for_status()
             data = resp.json()
 
-        msg = data.get("message", {})
+        msg = data.get("message", {}
+        )
         return {
             "content":    msg.get("content", ""),
             "tool_calls": msg.get("tool_calls"),
