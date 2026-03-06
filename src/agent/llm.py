@@ -28,15 +28,26 @@ os.environ.setdefault("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)
 
 
 def _claude_cli_available() -> bool:
-    """Comprueba si el claude CLI está instalado y autenticado."""
+    """Comprueba si el claude CLI está instalado Y autenticado."""
     import shutil, subprocess
     if not shutil.which("claude"):
         return False
     try:
+        # --version solo comprueba que existe
         result = subprocess.run(
             ["claude", "--version"], capture_output=True, timeout=5
         )
-        return result.returncode == 0
+        if result.returncode != 0:
+            return False
+        # Comprueba que hay sesión activa (auth)
+        auth = subprocess.run(
+            ["claude", "config", "get", "oauthToken"],
+            capture_output=True, timeout=5
+        )
+        # Si hay token OAuth O hay ANTHROPIC_API_KEY en el entorno, está autenticado
+        has_oauth = auth.returncode == 0 and auth.stdout.strip()
+        has_api_key = bool(os.getenv("ANTHROPIC_API_KEY", "").strip())
+        return has_oauth or has_api_key
     except Exception:
         return False
 
@@ -197,8 +208,7 @@ class OllamaClient:
             resp.raise_for_status()
             data = resp.json()
 
-        msg = data.get("message", {}
-        )
+        msg = data.get("message", {})
         return {
             "content":    msg.get("content", ""),
             "tool_calls": msg.get("tool_calls"),
@@ -238,15 +248,20 @@ class LLMClient:
         session_id: Optional[str] = None,
     ) -> Dict:
         if self._use_sdk:
-            # Extraer system + último user message
-            system = next((m["content"] for m in messages if m["role"] == "system"), None)
-            user_msgs = [m["content"] for m in messages if m["role"] == "user"]
-            prompt = user_msgs[-1] if user_msgs else ""
-            return await self._claude.query(
-                prompt=prompt,
-                system_prompt=system,
-                mcp_servers=mcp_servers,
-                session_id=session_id,
-            )
+            try:
+                system = next((m["content"] for m in messages if m["role"] == "system"), None)
+                user_msgs = [m["content"] for m in messages if m["role"] == "user"]
+                prompt = user_msgs[-1] if user_msgs else ""
+                return await self._claude.query(
+                    prompt=prompt,
+                    system_prompt=system,
+                    mcp_servers=mcp_servers,
+                    session_id=session_id,
+                )
+            except Exception as e:
+                print(f"⚠️  Claude SDK falló ({e}), cayendo a Ollama...")
+                if not hasattr(self, '_ollama'):
+                    self._ollama = OllamaClient()
+                return await self._ollama.query(messages=messages, tools=tools)
         else:
             return await self._ollama.query(messages=messages, tools=tools)
