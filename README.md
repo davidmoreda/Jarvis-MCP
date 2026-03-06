@@ -5,23 +5,26 @@ Servidor MCP personal siempre activo con múltiples conectores, accesible remota
 ## Arquitectura
 
 ```
-[Tú desde fuera via Tailscale] ──► [FastAPI Server :8000] ──► [Agent Core]
-                                                                      │
-                                                         [MCP Tool Connectors]
-                                              ┌───────────┬───────────┬──────────┬──────────┐
-                                        Google Cal    Home      Ficheros   Web      Projects
-                                          /Gmail    Assistant   Locales   Search    + APIs
+[Tú desde fuera via Tailscale] ──► [FastAPI :8000] ──► [Agent Core]
+                                                               │
+                                              [MCP Tool Connectors]
+                                   ┌──────────┬──────────┬──────────┬──────────┐
+                             Google Cal    Home      Ficheros   Web      Projects
+                               /Gmail    Assistant   Locales   Search    + APIs
+                                                               │
+                                                      [Ollama container]
+                                                     llama3.2 / mistral / qwen
 ```
 
 ## Stack
 
 - **Backend**: FastAPI (OpenAI-compatible `/v1/chat/completions`)
-- **LLM Principal**: Ollama local (llama3, mistral, qwen...) — 100% gratis, sin tokens
+- **Deploy**: Docker + Docker Compose — clonar y levantar
+- **LLM Principal**: Ollama local en contenedor (100% gratis, sin tokens)
 - **LLM Avanzado**: Claude API (opcional, para tareas complejas)
 - **Conectores**: MCP modular — cada conector es un módulo independiente
 - **Acceso remoto**: Tailscale VPN (seguro, sin exponer puertos)
-- **Persistencia**: systemd service (siempre activo tras reinicios)
-- **Memoria**: SQLite para historial de conversaciones
+- **Memoria**: SQLite persistente en volumen Docker
 
 ## Conectores disponibles
 
@@ -35,35 +38,64 @@ Servidor MCP personal siempre activo con múltiples conectores, accesible remota
 | `projects` | 🔧 WIP | Gestión de proyectos, notas, brainstorming |
 | `api_connector` | 🔧 WIP | Conector genérico a APIs externas |
 
-## Quickstart
+---
+
+## 🚀 Quickstart — clonar y levantar
+
+### Requisitos previos
+- [Docker](https://docs.docker.com/get-docker/) instalado
+- [Tailscale](https://tailscale.com/download) instalado en este PC y en tus dispositivos
+
+### 1. Clonar el repo
 
 ```bash
-# 1. Clonar y configurar
 git clone https://github.com/davidmoreda/Jarvis-MCP
 cd Jarvis-MCP
-cp .env.example .env
-# Edita .env con tus credenciales
-
-# 2. Instalar dependencias
-pip install -r requirements.txt
-
-# 3. Instalar Ollama
-curl -fsSL https://ollama.ai/install.sh | sh
-ollama pull llama3.2
-
-# 4. Ejecutar en desarrollo
-uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
-
-# 5. Instalar como servicio (siempre activo)
-sudo cp deploy/jarvis.service /etc/systemd/system/
-sudo systemctl enable --now jarvis
 ```
 
-## Acceso desde fuera via Tailscale
+### 2. Setup automático (recomendado)
 
 ```bash
-# Desde cualquier dispositivo en tu red Tailscale
-curl http://<tailscale-ip>:8000/v1/chat/completions \
+bash setup.sh
+```
+
+El script hace todo: crea `.env` con API key aleatoria, te pregunta qué modelo Ollama quieres, construye las imágenes y levanta los contenedores. Al terminar te da el endpoint y la API key lista para usar.
+
+### 2b. Setup manual (si prefieres)
+
+```bash
+cp .env.example .env
+# Edita .env con tu API key y credenciales
+docker compose up -d --build
+```
+
+### 3. Verificar que funciona
+
+```bash
+curl http://localhost:8000/health
+# → {"status": "ok", "version": "0.1.0"}
+```
+
+### 4. Primera llamada
+
+```bash
+# Saca tu API key del .env
+API_KEY=$(grep JARVIS_API_KEY .env | cut -d= -f2)
+
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "jarvis", "messages": [{"role": "user", "content": "Hola Jarvis, ¿qué puedes hacer?"}]}'
+```
+
+---
+
+## 🌐 Acceso desde fuera via Tailscale
+
+Una vez que Jarvis está corriendo, puedes llamarlo desde cualquier dispositivo en tu red Tailscale:
+
+```bash
+curl http://<tailscale-ip-de-tu-pc>:8000/v1/chat/completions \
   -H "Authorization: Bearer TU_JARVIS_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -72,12 +104,66 @@ curl http://<tailscale-ip>:8000/v1/chat/completions \
   }'
 ```
 
-Compatible con cualquier cliente que soporte OpenAI API (Open WebUI, Continue.dev, etc.)
+Compatible con cualquier cliente OpenAI API: **Open WebUI**, **Continue.dev**, **Cursor**, apps móviles, etc.
 
-## Estructura del proyecto
+---
+
+## ⚙️ Gestión de contenedores
+
+```bash
+# Ver logs en tiempo real
+docker compose logs -f jarvis
+
+# Reiniciar solo la API (sin tocar Ollama)
+docker compose restart jarvis
+
+# Parar todo
+docker compose down
+
+# Parar y borrar datos (¡cuidado!)
+docker compose down -v
+
+# Actualizar (pull + rebuild)
+git pull && docker compose up -d --build
+```
+
+---
+
+## 🔑 Configuración de conectores
+
+Edita `.env` para activar cada conector:
+
+**Home Assistant:**
+```
+HOME_ASSISTANT_URL=http://homeassistant.local:8123
+HOME_ASSISTANT_TOKEN=tu_long_lived_token
+```
+
+**Google Calendar / Gmail:**
+1. Crea un proyecto en [Google Cloud Console](https://console.cloud.google.com)
+2. Activa Calendar API y Gmail API
+3. Descarga `credentials.json` → cópialo en `credentials/google_credentials.json`
+4. El primer uso abrirá el flujo OAuth automáticamente
+
+**Brave Search** (opcional, mejores resultados que DuckDuckGo):
+```
+BRAVE_SEARCH_API_KEY=tu_key  # gratis hasta 2000 req/mes
+```
+
+**Claude API** (opcional, para razonamiento avanzado):
+```
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+---
+
+## 📁 Estructura del proyecto
 
 ```
 Jarvis-MCP/
+├── Dockerfile
+├── docker-compose.yml
+├── setup.sh                     # Wizard de primer arranque
 ├── src/
 │   ├── main.py                  # FastAPI entry point
 │   ├── agent/
@@ -97,9 +183,9 @@ Jarvis-MCP/
 │   └── auth/
 │       └── middleware.py        # API Key auth
 ├── deploy/
-│   └── jarvis.service           # systemd unit file
-├── tests/
+│   └── jarvis.service           # systemd unit (alternativa a Docker)
+├── credentials/                 # Google OAuth (gitignored)
+├── data/                        # SQLite DBs (gitignored)
 ├── .env.example
-├── requirements.txt
-└── README.md
+└── requirements.txt
 ```
