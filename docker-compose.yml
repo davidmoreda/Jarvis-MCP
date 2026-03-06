@@ -12,9 +12,9 @@ services:
     volumes:
       - jarvis-data:/app/data
       - ./credentials:/app/credentials:ro
-      - claude-config:/root/.claude
-    # Sin depends_on: Jarvis arranca siempre.
-    # Ollama es fallback opcional, no bloqueante.
+      # ⭐ Config del Claude CLI — persiste el login OAuth entre reinicios
+      # Después del primer "claude auth login" no hace falta volver a hacer login
+      - claude-config:/home/jarvis/.claude
     networks:
       - jarvis-net
 

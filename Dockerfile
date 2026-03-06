@@ -27,10 +27,14 @@ COPY src/ ./src/
 # ── Directorios persistentes ───────────────────────────────────────────────
 RUN mkdir -p data credentials
 
+# ── Usuario no-root (el Claude CLI no permite correr como root) ────────────
+RUN useradd -m -u 1000 jarvis \
+    && chown -R jarvis:jarvis /app
+
+USER jarvis
+
 # ── Config claude CLI ──────────────────────────────────────────────────────
-# El directorio ~/.claude persiste el login OAuth entre reinicios
-# Se monta como volumen en docker-compose.yml
-ENV CLAUDE_CONFIG_DIR=/root/.claude
+ENV CLAUDE_CONFIG_DIR=/home/jarvis/.claude
 
 EXPOSE 8000
 
