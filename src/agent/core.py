@@ -1,28 +1,30 @@
 """
-Agent Core — Agentic loop con tool calling
-Soporta Ollama (local) y Claude API (avanzado)
+Agent Core — Orquestador principal de Jarvis
+
+Con Claude Agent SDK el loop agéntico (tool calling, razonamiento multi-step)
+lo gestiona el propio SDK internamente. Core solo necesita:
+  1. Construir el prompt con contexto
+  2. Pasar los MCP servers disponibles
+  3. Guardar la sesión en memoria para continuidad
 """
-import json
 import uuid
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Optional
 
 from src.agent.llm import LLMClient
 from src.memory.store import MemoryStore
-from src.connectors.google_calendar import GoogleCalendarConnector
-from src.connectors.gmail import GmailConnector
-from src.connectors.home_assistant import HomeAssistantConnector
-from src.connectors.local_files import LocalFilesConnector
-from src.connectors.web_search import WebSearchConnector
-from src.connectors.projects import ProjectsConnector
-from src.connectors.api_connector import APIConnector
+from src.connectors.mcp_registry import MCPRegistry
 
 
-SYSTEM_PROMPT = """Eres Jarvis, un asistente personal de IA siempre activo.
-Tienes acceso a herramientas para gestionar el calendario, email, domótica,
-ficheros locales, búsqueda web, proyectos y APIs externas.
+SYSTEM_PROMPT = """Eres Jarvis, un asistente personal de IA siempre activo en el PC de tu usuario.
+Tienes acceso nativo a herramientas para: calendario, email, domótica, ficheros locales,
+búsqueda web, gestión de proyectos y APIs externas.
 
-Razona paso a paso antes de usar cualquier herramienta.
-Sé conciso, directo y útil. Responde siempre en el idioma del usuario.
+Reglas:
+- Razona paso a paso antes de actuar
+- Usa las herramientas disponibles sin pedir permiso para tareas rutinarias
+- Sé conciso y directo; evita respuestas largas si no las piden
+- Responde siempre en el idioma del usuario (español por defecto)
+- Si no puedes hacer algo, dilo claramente y sugiere alternativas
 """
 
 
@@ -30,29 +32,7 @@ class AgentCore:
     def __init__(self, memory: MemoryStore):
         self.memory = memory
         self.llm = LLMClient()
-
-        # Registrar todos los conectores
-        self.connectors = [
-            GoogleCalendarConnector(),
-            GmailConnector(),
-            HomeAssistantConnector(),
-            LocalFilesConnector(),
-            WebSearchConnector(),
-            ProjectsConnector(),
-            APIConnector(),
-        ]
-
-        # Construir mapa tool_name → conector
-        self.tool_map: Dict[str, Any] = {}
-        for connector in self.connectors:
-            for tool in connector.get_tools():
-                self.tool_map[tool["function"]["name"]] = connector
-
-    def _get_all_tools(self) -> List[Dict]:
-        tools = []
-        for connector in self.connectors:
-            tools.extend(connector.get_tools())
-        return tools
+        self.mcp = MCPRegistry()
 
     async def run(
         self,
@@ -62,79 +42,72 @@ class AgentCore:
     ) -> Dict:
         conv_id = conversation_id or str(uuid.uuid4())
 
-        # Cargar historial de memoria
-        history = self.memory.get_history(conv_id)
+        # Obtener session_id de Claude si existe para esta conversación
+        claude_session = self.memory.get_claude_session(conv_id)
 
-        # Construir contexto completo
-        full_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        full_messages.extend(history)
-        full_messages.extend(messages)
+        # Construir prompt incluyendo historial reciente como contexto
+        history = self.memory.get_history(conv_id, max_messages=10)
+        user_prompt = self._build_prompt(messages, history)
 
-        tools = self._get_all_tools()
+        # Obtener servidores MCP activos
+        mcp_servers = self.mcp.get_active_servers()
 
-        # Agentic loop (máx. 10 iteraciones)
-        for _ in range(10):
-            response = await self.llm.chat(
-                messages=full_messages,
-                tools=tools,
-                temperature=temperature,
-            )
+        # Llamar al LLM (SDK o Ollama)
+        response = await self.llm.chat(
+            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+            mcp_servers=mcp_servers if mcp_servers else None,
+            session_id=claude_session,
+        )
 
-            # Si no hay tool calls → respuesta final
-            if not response.get("tool_calls"):
-                assistant_content = response["content"]
+        assistant_content = response.get("content", "")
+        new_session_id = response.get("session_id")
 
-                # Guardar en memoria
-                for msg in messages:
-                    self.memory.add_message(conv_id, msg["role"], msg["content"])
-                self.memory.add_message(conv_id, "assistant", assistant_content)
+        # Persistir sesión Claude para continuidad de conversación
+        if new_session_id:
+            self.memory.set_claude_session(conv_id, new_session_id)
 
-                return {
-                    "id": f"jarvis-{uuid.uuid4().hex[:8]}",
-                    "object": "chat.completion",
-                    "model": "jarvis",
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": assistant_content},
-                        "finish_reason": "stop"
-                    }],
-                    "usage": response.get("usage", {})
-                }
+        # Guardar en memoria
+        for msg in messages:
+            if msg["role"] in ("user", "assistant"):
+                self.memory.add_message(conv_id, msg["role"], msg["content"])
+        self.memory.add_message(conv_id, "assistant", assistant_content)
 
-            # Ejecutar tool calls
-            full_messages.append({
-                "role": "assistant",
-                "content": response.get("content", ""),
-                "tool_calls": response["tool_calls"]
-            })
-
-            for tool_call in response["tool_calls"]:
-                tool_name = tool_call["function"]["name"]
-                tool_args = json.loads(tool_call["function"]["arguments"])
-
-                connector = self.tool_map.get(tool_name)
-                if connector:
-                    try:
-                        result = await connector.call_tool(tool_name, tool_args)
-                    except Exception as e:
-                        result = {"error": str(e)}
-                else:
-                    result = {"error": f"Tool '{tool_name}' not found"}
-
-                full_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call["id"],
-                    "content": json.dumps(result, ensure_ascii=False)
-                })
+        cost = response.get("cost_usd")
+        usage = response.get("usage", {})
 
         return {
-            "id": f"jarvis-{uuid.uuid4().hex[:8]}",
+            "id":     f"jarvis-{uuid.uuid4().hex[:8]}",
             "object": "chat.completion",
-            "model": "jarvis",
+            "model":  f"jarvis/{self.llm.backend}",
             "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "Alcanzado el límite de iteraciones del agente."},
-                "finish_reason": "stop"
+                "index":        0,
+                "message":      {"role": "assistant", "content": assistant_content},
+                "finish_reason": "stop",
             }],
-            "usage": {}
+            "usage": usage,
+            # Extras informativos (no estándar OpenAI, pero útiles)
+            "jarvis_meta": {
+                "conversation_id": conv_id,
+                "claude_session":  new_session_id,
+                "cost_usd":        cost,
+                "turns":           response.get("turns"),
+                "backend":         self.llm.backend,
+            },
         }
+
+    def _build_prompt(self, messages: List[Dict], history: List[Dict]) -> str:
+        """Construye el prompt final con historial si Ollama está activo."""
+        # Con Claude SDK el historial se gestiona via session_id, no hace falta aquí
+        if self.llm.backend == "claude-sdk":
+            user_msgs = [m["content"] for m in messages if m["role"] == "user"]
+            return user_msgs[-1] if user_msgs else ""
+
+        # Para Ollama: incluir historial en el prompt
+        lines = []
+        for m in history[-6:]:
+            prefix = "Usuario" if m["role"] == "user" else "Jarvis"
+            lines.append(f"{prefix}: {m['content']}")
+        for m in messages:
+            if m["role"] == "user":
+                lines.append(f"Usuario: {m['content']}")
+        return "\n".join(lines)
